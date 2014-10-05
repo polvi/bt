@@ -3,13 +3,17 @@ package bt
 import (
 	"bytes"
 	"code.google.com/p/bencode-go"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/polvi/bt/chunker"
 	"io"
 	"io/ioutil"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -47,11 +51,11 @@ type ResponseWriter interface {
 }
 
 type Request struct {
-	Body       io.ReadCloser
-	RemotePeer *Peer
-	PeerAddr   string
-	Id         int
-	Payload    []byte
+	Body     io.ReadCloser
+	PeerConn *PeerConn
+	PeerAddr string
+	Id       int
+	Payload  []byte
 }
 type Response struct {
 	Body io.ReadCloser
@@ -141,57 +145,20 @@ func (h *Handshake) MarshalBinary() (data []byte, err error) {
 
 const HANDSHAKE_BYTES int = 68
 
-func (p *Peer) HandshakeHandler(w ResponseWriter, r *Request) (*Peer, error) {
-	out := make([]byte, HANDSHAKE_BYTES)
-	_, err := r.Body.Read(out)
-	if err != nil {
-		return nil, errors.New("error reading handshake: " + err.Error())
-	}
-	h := Handshake{}
-	err = h.UnmarshalBinary(out)
-	if err != nil {
-		return nil, errors.New("error reading handshake: " + err.Error())
-	}
-	rp := &Peer{
-		PeerId: h.PeerId,
-	}
-
-	if !p.handshake_sent {
-		my_h := Handshake{
-			InfoHash: p.MetaInfo.InfoHash,
-			PeerId:   p.PeerId,
-		}
-		out, err = my_h.MarshalBinary()
-		if err != nil {
-			return nil, errors.New("error reading handshake: " + err.Error())
-		}
-		// send handshake response
-		if _, err := w.Write(out); err != nil {
-			return nil, errors.New("error reading handshake: " + err.Error())
-		}
-	}
-	// now send bitfield
-	bs, err := Bitfield(p.Bitfield.Bytes())
-	if err != nil {
-		return nil, err
-	}
-	if _, err := w.Write(bs); err != nil {
-		return nil, errors.New("error reading handshake: " + err.Error())
-	}
-	return rp, nil
-}
 func (p *Peer) ChokeHandler(w ResponseWriter, r *Request) {
-	p.Choked = true
+	r.PeerConn.Choked = true
 }
 
 func (p *Peer) UnchokeHandler(w ResponseWriter, r *Request) {
-	p.Choked = false
+	r.PeerConn.Choked = false
+	p.FlushRequests(r.PeerConn)
 }
 func (p *Peer) InterestedHandler(w ResponseWriter, r *Request) {
-	p.Interested = true
+	r.PeerConn.Interested = true
 }
 func (p *Peer) UninterestedHandler(w ResponseWriter, r *Request) {
-	p.Interested = false
+	r.PeerConn.Interested = false
+	r.PeerConn.RequestQueue = make(map[string]RequestQueueMsg)
 }
 
 /*
@@ -206,7 +173,7 @@ func (p *Peer) HaveHandler(w ResponseWriter, r *Request) {
 	pce := int(*piece)
 	// validate index within bounds, drop conn otherwise
 	if !p.Bitfield.InRange(pce) {
-		w.Close()
+		r.PeerConn.Conn.Close()
 	}
 
 	// I have this piece, do nothing
@@ -220,27 +187,44 @@ func (p *Peer) HaveHandler(w ResponseWriter, r *Request) {
 		w.Close()
 	}
 	w.Write(m)
-
-	// XXX send request for piece?
+	// send a request for it
+	out, err := RequestMsg(pce, 0, int(p.MetaInfo.Info.PieceLength))
+	if err != nil {
+		return
+	}
+	w.Write(out)
 }
+
+func (p *Peer) FlushRequests(pc *PeerConn) error {
+	for _, r := range pc.RequestQueue {
+		out := make([]byte, r.block_len)
+		offset := (int(p.MetaInfo.Info.PieceLength) * r.piece) + r.block_off
+		n, err := p.File.ReadAt(out, int64(offset))
+		if err == io.EOF {
+			out = out[:n]
+		}
+		if err != nil && err != io.EOF {
+			fmt.Println("error reading file", err)
+			return err
+		}
+		_, err = pc.Conn.Write(out)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *Peer) BitfieldHandler(w ResponseWriter, r *Request) {
 	bs, err := NewBitsetFromBytes(p.MetaInfo.NumPieces, r.Payload)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	p.RemotePeer.Bitfield = bs
-	i := p.Bitfield.FindNextClear(0)
-	if i >= 0 && p.RemotePeer.Bitfield.IsSet(i) {
-		out, err := RequestMsg(i, 0, int(p.MetaInfo.Info.PieceLength))
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		w.Write(out)
-
-	}
+	r.PeerConn.RemotePeer.Bitfield = bs
+	p.BitfieldNotify <- r.PeerConn
 }
+
 func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
 	rr := bytes.NewReader(r.Payload)
 	piece := new(int32)
@@ -260,7 +244,7 @@ func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
 	}
 	out := make([]byte, *block_len)
 	offset := (int(p.MetaInfo.Info.PieceLength) * int(*piece)) + int(*block_off)
-	n, err := p.File.ReadAt(out, int64(offset))
+	n, err := p.Chunker.GetFile().ReadAt(out, int64(offset))
 	if err == io.EOF {
 		out = out[:n]
 	}
@@ -268,12 +252,22 @@ func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
 		fmt.Println("error reading file", err)
 		return
 	}
-	fmt.Println(*piece, p.MetaInfo.Info.PieceLength, len(out))
+	//	if !r.PeerConn.Choked {
 	out, err = PieceMsg(int(*piece), int(*block_off), out)
 	if err != nil {
 		return
 	}
 	w.Write(out)
+	/*
+		} else {
+			r.PeerConn.RequestQueue[fmt.Sprintf("%d,%d,%d")] = RequestQueueMsg{
+				piece:     int(*piece),
+				block_off: int(*block_off),
+				block_len: int(*block_len),
+			}
+
+		}
+	*/
 }
 func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 	rr := bytes.NewReader(r.Payload)
@@ -293,49 +287,82 @@ func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 		return
 
 	}
-	off := (int(*piece) * int(p.MetaInfo.Info.PieceLength)) + int(*block_off)
-	_, err = p.File.WriteAt(block_data, int64(off))
+	_, err = p.Chunker.Apply(block_data)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	p.Bitfield.Set(int(*piece))
-	i := p.Bitfield.FindNextClear(0)
-	if i >= 0 && p.RemotePeer.Bitfield.IsSet(i) {
-		out, err := RequestMsg(i, 0, int(p.MetaInfo.Info.PieceLength))
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		w.Write(out)
-	}
+	p.BitfieldNotify <- r.PeerConn
 }
 func (p *Peer) CancelHandler(w ResponseWriter, r *Request) {
 	// not sure what to do here
+	rr := bytes.NewReader(r.Payload)
+	piece := new(int32)
+	if err := binary.Read(rr, binary.BigEndian, piece); err != nil {
+		w.Close()
+		return
+	}
+	block_off := new(int32)
+	if err := binary.Read(rr, binary.BigEndian, block_off); err != nil {
+		w.Close()
+		return
+	}
+	block_len := new(int32)
+	if err := binary.Read(rr, binary.BigEndian, block_len); err != nil {
+		w.Close()
+		return
+	}
+	delete(r.PeerConn.RequestQueue, fmt.Sprintf("%d,%d,%d"))
 }
-func (p *Peer) Connect(peerAddr string) error {
-	hs := &Handshake{
-		PeerId:   p.PeerId,
-		InfoHash: p.MetaInfo.InfoHash,
+
+type RequestQueueMsg struct {
+	piece     int
+	block_off int
+	block_len int
+}
+
+func (p *Peer) Connect(peers ...*Peer) error {
+	for _, rp := range peers {
+		hs := &Handshake{
+			PeerId:   p.PeerId,
+			InfoHash: p.MetaInfo.InfoHash,
+		}
+		out, err := hs.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		conn, err := net.Dial("tcp", rp.PeerAddr)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(conn, bytes.NewReader(out)); err != nil {
+			return err
+		}
+		h, err := p.ReadHandshake(conn)
+		if err != nil {
+			conn.Close()
+			return err
+		}
+		pc := p.NewPeerConn(conn, h.PeerId)
+		if err := p.SendBitfield(pc); err != nil {
+			pc.Conn.Close()
+			return err
+		}
+		go p.handleRequests(pc)
+		p.PeerNotify <- pc
 	}
-	out, err := hs.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	req, err := NewRequest(peerAddr, bytes.NewReader(out))
-	if err != nil {
-		return err
-	}
-	conn, err := net.Dial("tcp", req.PeerAddr)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(conn, req.Body); err != nil {
-		return err
-	}
-	p.handshake_sent = true
-	p.peer(conn)
 	return nil
+}
+
+func (p *Peer) NewPeerConn(conn net.Conn, id string) *PeerConn {
+	return &PeerConn{
+		Conn:         conn,
+		RemotePeer:   &Peer{PeerId: id, Bitfield: NewBitset(p.MetaInfo.NumPieces)},
+		Choked:       true,
+		Interested:   false,
+		RequestQueue: make(map[string]RequestQueueMsg),
+	}
 }
 
 const (
@@ -375,8 +402,100 @@ func message(id int, payload []byte) ([]byte, error) {
 func Interested() ([]byte, error) {
 	return message(INTERESTED, []byte{})
 }
-func Bitfield(bf []byte) ([]byte, error) {
-	return message(BITFIELD, bf)
+func (p *Peer) RarestFirst() int {
+	// this needs to be smarter
+	return p.Bitfield.FindNextClear(0)
+}
+func (p *Peer) tryPiece() {
+	piece := p.RarestFirst()
+	if piece < 0 {
+		return
+	}
+	for _, pc := range p.PeerConns {
+		if pc.RemotePeer.Bitfield.IsSet(piece) {
+			pc.SendInterested()
+			pc.SendRequest(piece, 0, int(p.MetaInfo.Info.PieceLength))
+			return
+		}
+	}
+}
+func (p *Peer) Fetch() error {
+	tick := time.Tick(1 * time.Second)
+	for {
+		select {
+		/*
+			case <-p.Chunker.DoneNotify():
+				for pc := range p.PeerConns {
+					peer := p.PeerConns[pc].RemotePeer
+				}
+		*/
+		//	return nil
+		case pc := <-p.PeerNotify:
+			if err := p.SendUnchoke(pc); err != nil {
+				pc.Conn.Close()
+				return err
+			}
+		case pc := <-p.BitfieldNotify:
+			p.PeerConns[pc.RemotePeer.PeerId] = pc
+			p.tryPiece()
+		case <-tick:
+			//fmt.Println(p.PeerId, "                  ME\t", p.Bitfield)
+			/*
+				for pc := range p.PeerConns {
+					peer := p.PeerConns[pc].RemotePeer
+					fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
+				}
+			*/
+		}
+	}
+}
+func (p *Peer) SendUnchoke(pc *PeerConn) error {
+	m, err := message(UNCHOKE, []byte{})
+	if err != nil {
+		return err
+	}
+	_, err = pc.Conn.Write(m)
+	return err
+}
+func (p *Peer) SendBitfield(pc *PeerConn) error {
+	bf := p.Bitfield.Bytes()
+	m, err := message(BITFIELD, bf)
+
+	if err != nil {
+		return err
+	}
+	_, err = pc.Conn.Write(m)
+	return err
+}
+func (pc *PeerConn) SendInterested() error {
+	m, err := message(INTERESTED, []byte{})
+	if err != nil {
+		return err
+	}
+	_, err = pc.Conn.Write(m)
+	return err
+}
+
+func (pc *PeerConn) SendRequest(piece int, block_off int, block_len int) error {
+	m, err := RequestMsg(piece, block_off, block_len)
+	if err != nil {
+		return err
+	}
+	_, err = pc.Conn.Write(m)
+	return err
+}
+
+func (p *Peer) SendHave(pc *PeerConn, piece int) error {
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.BigEndian, int32(piece)); err != nil {
+		return err
+	}
+	m, err := message(HAVE, buf.Bytes())
+	if err != nil {
+		return err
+	}
+	_, err = pc.Conn.Write(m)
+	return nil
 }
 
 // Piece Index | Block Offset | Block Length
@@ -441,41 +560,81 @@ func Cancel(pi int, bo int, bl int) ([]byte, error) {
 	return message(CANCEL, buf.Bytes())
 }
 
+type PeerConn struct {
+	handshake_sent bool
+	Conn           net.Conn
+	RemotePeer     *Peer
+	Choked         bool
+	Interested     bool
+	RequestQueue   map[string]RequestQueueMsg
+}
 type Peer struct {
 	PeerAddr       string
 	PeerId         string
 	Listener       net.Listener
 	Handshake      bool
-	Choked         bool
-	Interested     bool
 	MetaInfo       *MetaInfo
 	Bitfield       *Bitset
-	RemotePeer     *Peer
 	File           *os.File
-	handshake_sent bool
+	Chunker        *chunker.Chunker
+	PeerConns      map[string]*PeerConn
+	BitfieldNotify chan *PeerConn
+	PeerNotify     chan *PeerConn
+	PieceNotify    chan int
+	ShutdownNotify chan bool
 }
 
-func (p *Peer) ReadRequest(b io.ReadCloser, peer *Peer) (req *Request, err error) {
+func (p *Peer) TrackerURL() (string, error) {
+	u := new(url.URL)
+	q := u.Query()
+	q.Add("info_hash", p.MetaInfo.InfoHash)
+	q.Add("peer_id", p.PeerId)
+	_, port, err := net.SplitHostPort(p.PeerAddr)
+	if err != nil {
+		return "", err
+	}
+	q.Add("port", port)
+	// XXX This is a base ten integer value. It denotes the total amount of bytes that the peer has uploaded in the swarm since it sent the "started" event to the tracker. This key is REQUIRED.
+	q.Add("uploaded", "0")
+	// XXX This is a base ten integer value. It denotes the total amount of bytes that the peer has downloaded in the swarm since it sent the "started" event to the tracker. This key is REQUIRED.
+	q.Add("left", fmt.Sprintf("%v", p.MetaInfo.Info.Length))
+	u.RawQuery = q.Encode()
+	return fmt.Sprintf("%s%s", p.MetaInfo.Announce, u), nil
+}
+func (p *Peer) ReadHandshake(conn net.Conn) (h Handshake, err error) {
+	out := make([]byte, HANDSHAKE_BYTES)
+	_, err = conn.Read(out)
+	if err != nil {
+		return Handshake{}, errors.New("error reading handshake: " + err.Error())
+	}
+	h = Handshake{}
+	err = h.UnmarshalBinary(out)
+	if err != nil {
+		return Handshake{}, errors.New("error reading handshake: " + err.Error())
+	}
+	return h, nil
+}
+func (p *Peer) ReadRequest(pc *PeerConn) (req *Request, err error) {
 	// if ml == 0, return
 	// if ml > 1, get payload
 	// if ml == 1 set id, no payload
 	// assume Peer Wire Messages, read message length and type
 	r := &Request{
-		Id:         -1,
-		RemotePeer: peer,
-		Payload:    []byte{},
+		Id:       -1,
+		PeerConn: pc,
+		Payload:  []byte{},
 	}
 	ml := new(int32)
-	if err := binary.Read(b, binary.BigEndian, ml); err != nil {
-		b.Close()
+	if err := binary.Read(pc.Conn, binary.BigEndian, ml); err != nil {
+		pc.Conn.Close()
 	}
 	if *ml == 0 {
 		// keepalive
 		return r, nil
 	}
 	id := new(int8)
-	if err := binary.Read(b, binary.BigEndian, id); err != nil {
-		b.Close()
+	if err := binary.Read(pc.Conn, binary.BigEndian, id); err != nil {
+		pc.Conn.Close()
 	}
 	r.Id = int(*id)
 	if *ml == 1 {
@@ -485,8 +644,8 @@ func (p *Peer) ReadRequest(b io.ReadCloser, peer *Peer) (req *Request, err error
 	// This is an integer which denotes the length of the message,
 	// excluding the length part itself. If a message has no payload, its size is 1.
 	payload := make([]byte, *ml-1)
-	if err := binary.Read(b, binary.BigEndian, payload); err != nil {
-		b.Close()
+	if err := binary.Read(pc.Conn, binary.BigEndian, payload); err != nil {
+		pc.Conn.Close()
 	}
 	r.Payload = payload
 	return r, nil
@@ -514,7 +673,7 @@ func (r *Request) String() string {
 		m = "cancel"
 	}
 
-	return fmt.Sprintf("-> %s %s %v bytes", r.RemotePeer.PeerId, m, len(r.Payload))
+	return fmt.Sprintf("-> %s %s %v bytes", r.PeerConn.RemotePeer.PeerId, m, len(r.Payload))
 }
 
 func (p *Peer) FindHandler(r *Request) (HandlerFunc, error) {
@@ -541,30 +700,19 @@ func (p *Peer) FindHandler(r *Request) (HandlerFunc, error) {
 	return nil, errors.New("unknown message")
 }
 
-// PeerA: connects, sends handshake
-// PeerB: read handshake, write handshake, sends bitfield
-// PeerA: read handshake, sends bitfield
-func (p *Peer) peer(conn net.Conn) {
-	remotePeer, err := p.HandshakeHandler(conn, &Request{Body: conn})
-	if err != nil {
-		conn.Close()
-		fmt.Println("closing connection", err)
-		return
-	}
-	p.RemotePeer = remotePeer
-	fmt.Println(p.PeerId, "peered with", remotePeer.PeerId)
+func (p *Peer) handleRequests(pc *PeerConn) {
 	for {
-		r, err := p.ReadRequest(conn, remotePeer)
+		r, err := p.ReadRequest(pc)
 		if err != nil {
-			conn.Close()
+			pc.Conn.Close()
 		}
 
-		fmt.Println(p.PeerId, "request", r)
+		//		fmt.Println(p.PeerId, "request", r)
 		h, err := p.FindHandler(r)
 		if err != nil {
-			conn.Close()
+			pc.Conn.Close()
 		}
-		h.ServePWP(conn, r)
+		h.ServePWP(pc.Conn, r)
 	}
 }
 
@@ -575,12 +723,178 @@ func (p *Peer) Serve(l net.Listener) error {
 		if e != nil {
 			return e
 		}
-		go p.peer(conn)
+		h, err := p.ReadHandshake(conn)
+		if err != nil {
+			conn.Close()
+			return errors.New("error reading handshake: " + err.Error())
+		}
+		// send my handshake
+		my_h := Handshake{
+			InfoHash: p.MetaInfo.InfoHash,
+			PeerId:   p.PeerId,
+		}
+		out, err := my_h.MarshalBinary()
+		if err != nil {
+			conn.Close()
+			return errors.New("error reading handshake: " + err.Error())
+		}
+		if _, err := conn.Write(out); err != nil {
+			conn.Close()
+			return errors.New("error reading handshake: " + err.Error())
+		}
+
+		pc := p.NewPeerConn(conn, h.PeerId)
+		// initialize bitfield incase remote end does not send one
+		if err := p.SendBitfield(pc); err != nil {
+			pc.Conn.Close()
+			return err
+		}
+		go p.handleRequests(pc)
+		p.PeerNotify <- pc
+	}
+}
+func NewPeer(meta *MetaInfo) *Peer {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if l, err = net.Listen("tcp6", "[::1]:0"); err != nil {
+			panic(fmt.Sprintf("failed to listen on a port: %v", err))
+		}
+	}
+	p := &Peer{PeerAddr: l.Addr().String(), Listener: l}
+	id := make([]byte, 20)
+	_, err = rand.Read(id)
+	if err != nil {
+		panic(fmt.Sprintf("failed to get peerid: %v", err))
+	}
+	i := fmt.Sprintf("%x", id)
+	p.PeerId = i[:20]
+	p.MetaInfo = meta
+
+	p.Bitfield = NewBitset(meta.NumPieces)
+	c, err := chunker.NewChunker(
+		p.MetaInfo.PiecesList,
+		int(p.MetaInfo.Info.PieceLength),
+		int(p.MetaInfo.Info.Length))
+	if err != nil {
+		panic(fmt.Sprintf("unable to create chunker"))
+	}
+	p.Chunker = c
+	p.PeerConns = make(map[string]*PeerConn)
+	p.PeerNotify = make(chan *PeerConn)
+	p.PieceNotify = make(chan int)
+	p.BitfieldNotify = make(chan *PeerConn)
+	p.ShutdownNotify = make(chan bool)
+	go p.Serve(p.Listener)
+	return p
+}
+func (p *Peer) Start() error {
+	go p.Fetch()
+	tr, err := p.SendTrackerPing()
+	if err != nil {
+		return err
+	}
+	tick := time.Tick(time.Second * 1)
+	active_peers := make(map[string]bool)
+	for {
+		select {
+		case <-p.ShutdownNotify:
+			return nil
+		case <-tick:
+			for _, peer := range tr.Peers {
+				if _, ok := active_peers[peer.PeerId]; !ok {
+					active_peers[peer.PeerId] = true
+					if peer.PeerId == p.PeerId {
+						continue
+					}
+					rp := &Peer{
+						PeerAddr: fmt.Sprintf("%s:%d", peer.Ip, peer.Port),
+					}
+					p.Connect(rp)
+				}
+			}
+			tr, err = p.SendTrackerPing()
+			if err != nil {
+				return err
+			}
+
+		}
+	}
+
+}
+func (p *Peer) StartNoConnect() error {
+	go p.Fetch()
+	tr, err := p.SendTrackerPing()
+	if err != nil {
+		return err
+	}
+	tick := time.Tick(time.Second * 1)
+	active_peers := make(map[string]bool)
+	for {
+		for _, peer := range tr.Peers {
+			if _, ok := active_peers[peer.PeerId]; !ok {
+				active_peers[peer.PeerId] = true
+				/*
+					if peer.PeerId == p.PeerId {
+						continue
+					}
+					rp := &Peer{
+						PeerAddr: fmt.Sprintf("%s:%d", peer.Ip, peer.Port),
+					}
+					fmt.Println(p.PeerId, peer.PeerId, "connecting to")
+					p.Connect(rp)
+				*/
+			}
+		}
+		<-tick
+		tr, err = p.SendTrackerPing()
+		if err != nil {
+			return err
+		}
+	}
+
+}
+
+type TrackerPeer struct {
+	PeerId string "peer id"
+	Ip     string "ip"
+	Port   int    "port"
+}
+type TrackerResponse struct {
+	Interval int           "interval"
+	Peers    []TrackerPeer "peers"
+}
+
+func (p *Peer) SendTrackerPing() (*TrackerResponse, error) {
+	u, err := p.TrackerURL()
+	if err != nil {
+		return nil, err
+	}
+	res, err := http.Get(u)
+	defer res.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	tr := new(TrackerResponse)
+	err = bencode.Unmarshal(res.Body, tr)
+	if err != nil {
+		return nil, err
+	}
+	return tr, nil
+}
+func (p *Peer) seedLoop() {
+	for {
+		select {
+		case pc := <-p.PeerNotify:
+			p.SendBitfield(pc)
+		case <-p.BitfieldNotify:
+		case <-p.Chunker.DoneNotify():
+		}
 	}
 }
 
 func (p *Peer) Close() {
 	p.Listener.Close()
+	p.Chunker.Cleanup()
 }
 
 func NewTorrent(file string) (t *Torrent, err error) {
@@ -590,16 +904,12 @@ func NewTorrent(file string) (t *Torrent, err error) {
 		return nil, err
 	}
 	tor.MetaInfo = meta
-
-	//	numPieces := int((meta.Info.Length + meta.Info.PieceLength - 1) / meta.Info.PieceLength)
-	//	ref := []byte(meta.Info.Pieces)
 	tor.PieceMap = make(map[string]int)
 
 	pieces := tor.MetaInfo.GetPiecesList()
 	for i, p := range pieces {
 		tor.PieceMap[p] = i
 	}
-	//	tor.MetaInfo.DumpTorrentMetaInfo()
 	return tor, nil
 }
 

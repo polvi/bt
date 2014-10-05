@@ -1,42 +1,15 @@
 package bttest
 
 import (
+	"bufio"
 	"bytes"
-	"crypto/rand"
-	"fmt"
 	"github.com/polvi/bt"
-	"net"
+	"io"
 	"os"
 )
 
-func NewPeer(meta *bt.MetaInfo) *bt.Peer {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		if l, err = net.Listen("tcp6", "[::1]:0"); err != nil {
-			panic(fmt.Sprintf("bttest: failed to listen on a port: %v", err))
-		}
-	}
-	p := &bt.Peer{PeerAddr: l.Addr().String(), Listener: l}
-	id := make([]byte, 20)
-	_, err = rand.Read(id)
-	if err != nil {
-		panic(fmt.Sprintf("failed to get peerid: %v", err))
-	}
-	i := fmt.Sprintf("%x", id)
-	p.PeerId = i[:20]
-	p.MetaInfo = meta
-
-	f_out, err := os.Create("dat2.bz2")
-	if err != nil {
-		panic(fmt.Sprintf("bttest: failed to create backing file: %v", err))
-	}
-	p.File = f_out
-	p.Bitfield = bt.NewBitset(meta.NumPieces)
-	go p.Serve(p.Listener)
-	return p
-}
 func NewPeerWithData(meta *bt.MetaInfo, filename string) (*bt.Peer, error) {
-	p := NewPeer(meta)
+	p := bt.NewPeer(meta)
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -45,6 +18,23 @@ func NewPeerWithData(meta *bt.MetaInfo, filename string) (*bt.Peer, error) {
 	for i := 0; i < meta.NumPieces; i++ {
 		p.Bitfield.Set(i)
 	}
+	buf := bufio.NewReaderSize(f, int(p.MetaInfo.Info.PieceLength))
+	io.Copy(p.Chunker, buf)
+	return p, nil
+}
+func NewPeerWithDataPieces(meta *bt.MetaInfo, filename string, pieces int, piece_off int) (*bt.Peer, error) {
+	p := bt.NewPeer(meta)
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	p.File = f
+	for i := piece_off; i < piece_off+pieces; i++ {
+		p.Bitfield.Set(i)
+	}
+	f.Seek(p.MetaInfo.Info.PieceLength*int64(piece_off), 0)
+	buf := bufio.NewReaderSize(f, int(p.MetaInfo.Info.PieceLength))
+	io.Copy(p.Chunker, buf)
 	return p, nil
 }
 

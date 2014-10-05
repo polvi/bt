@@ -15,6 +15,18 @@ type Bitset struct {
 	endMask  byte // Which bits of the last byte are valid
 }
 
+func (b *Bitset) String() string {
+	s := ""
+	for i := 0; i < b.n; i++ {
+		if b.IsSet(i) {
+			s += "1"
+		} else {
+			s += "0"
+		}
+	}
+	return s
+}
+
 func NewBitset(n int) *Bitset {
 	endIndex, endOffset := n>>3, n&7
 	endMask := ^byte(255 >> byte(endOffset))
