@@ -423,13 +423,6 @@ func (p *Peer) Fetch() error {
 	tick := time.Tick(1 * time.Second)
 	for {
 		select {
-		/*
-			case <-p.Chunker.DoneNotify():
-				for pc := range p.PeerConns {
-					peer := p.PeerConns[pc].RemotePeer
-				}
-		*/
-		//	return nil
 		case pc := <-p.PeerNotify:
 			if err := p.SendUnchoke(pc); err != nil {
 				pc.Conn.Close()
@@ -753,6 +746,7 @@ func (p *Peer) Serve(l net.Listener) error {
 		p.PeerNotify <- pc
 	}
 }
+
 func NewPeer(meta *MetaInfo) *Peer {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -789,69 +783,22 @@ func NewPeer(meta *MetaInfo) *Peer {
 }
 func (p *Peer) Start() error {
 	go p.Fetch()
-	tr, err := p.SendTrackerPing()
+	tr, err := p.TrackerUpdate()
 	if err != nil {
 		return err
 	}
-	tick := time.Tick(time.Second * 1)
-	active_peers := make(map[string]bool)
+	tick := time.Tick(time.Second * time.Duration(tr.Interval))
 	for {
 		select {
 		case <-p.ShutdownNotify:
 			return nil
 		case <-tick:
-			for _, peer := range tr.Peers {
-				if _, ok := active_peers[peer.PeerId]; !ok {
-					active_peers[peer.PeerId] = true
-					if peer.PeerId == p.PeerId {
-						continue
-					}
-					rp := &Peer{
-						PeerAddr: fmt.Sprintf("%s:%d", peer.Ip, peer.Port),
-					}
-					p.Connect(rp)
-				}
-			}
-			tr, err = p.SendTrackerPing()
+			_, err := p.TrackerUpdate()
 			if err != nil {
 				return err
 			}
-
 		}
 	}
-
-}
-func (p *Peer) StartNoConnect() error {
-	go p.Fetch()
-	tr, err := p.SendTrackerPing()
-	if err != nil {
-		return err
-	}
-	tick := time.Tick(time.Second * 1)
-	active_peers := make(map[string]bool)
-	for {
-		for _, peer := range tr.Peers {
-			if _, ok := active_peers[peer.PeerId]; !ok {
-				active_peers[peer.PeerId] = true
-				/*
-					if peer.PeerId == p.PeerId {
-						continue
-					}
-					rp := &Peer{
-						PeerAddr: fmt.Sprintf("%s:%d", peer.Ip, peer.Port),
-					}
-					fmt.Println(p.PeerId, peer.PeerId, "connecting to")
-					p.Connect(rp)
-				*/
-			}
-		}
-		<-tick
-		tr, err = p.SendTrackerPing()
-		if err != nil {
-			return err
-		}
-	}
-
 }
 
 type TrackerPeer struct {
@@ -864,7 +811,7 @@ type TrackerResponse struct {
 	Peers    []TrackerPeer "peers"
 }
 
-func (p *Peer) SendTrackerPing() (*TrackerResponse, error) {
+func (p *Peer) TrackerUpdate() (*TrackerResponse, error) {
 	u, err := p.TrackerURL()
 	if err != nil {
 		return nil, err
@@ -879,17 +826,18 @@ func (p *Peer) SendTrackerPing() (*TrackerResponse, error) {
 	if err != nil {
 		return nil, err
 	}
-	return tr, nil
-}
-func (p *Peer) seedLoop() {
-	for {
-		select {
-		case pc := <-p.PeerNotify:
-			p.SendBitfield(pc)
-		case <-p.BitfieldNotify:
-		case <-p.Chunker.DoneNotify():
+	for _, peer := range tr.Peers {
+		if _, ok := p.PeerConns[peer.PeerId]; !ok {
+			if peer.PeerId == p.PeerId {
+				continue
+			}
+			rp := &Peer{
+				PeerAddr: fmt.Sprintf("%s:%d", peer.Ip, peer.Port),
+			}
+			p.Connect(rp)
 		}
 	}
+	return tr, nil
 }
 
 func (p *Peer) Close() {

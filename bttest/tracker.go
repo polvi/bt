@@ -63,7 +63,7 @@ func announceHandler(w http.ResponseWriter, r *http.Request, s *trackerStatus) {
 		t.ip = host
 		s.peers[v.Get("info_hash")][v.Get("peer_id")] = t
 	}
-	tr := TrackerResponse{Interval: 60}
+	tr := TrackerResponse{Interval: 1}
 	if p, ok := s.peers[v.Get("info_hash")]; ok {
 		for k, tp := range p {
 			tr.Peers = append(tr.Peers, TrackerPeer{
