@@ -165,41 +165,39 @@ func (p *Peer) UninterestedHandler(w ResponseWriter, r *Request) {
 payload of length 4. The payload is a number denoting the index of a piece that the peer has successfully downloaded and validated. A peer receiving this message must validate the index and drop the connection if this index is not within the expected bounds. Also, a peer receiving this message MUST send an interested message to the sender if indeed it lacks the piece announced. Further, it MAY also send a request for that piece.
 */
 func (p *Peer) HaveHandler(w ResponseWriter, r *Request) {
-	piece := new(int32)
-	if err := binary.Read(bytes.NewReader(r.Payload), binary.BigEndian, piece); err != nil {
+	pce := new(int32)
+	if err := binary.Read(bytes.NewReader(r.Payload), binary.BigEndian, pce); err != nil {
 		w.Close()
 		return
 	}
-	pce := int(*piece)
+	piece := int(*pce)
 	// validate index within bounds, drop conn otherwise
-	if !p.Bitfield.InRange(pce) {
+	if !p.Bitfield.InRange(piece) {
 		r.PeerConn.Conn.Close()
 	}
 
+	// update my records for this remote peer
+	r.PeerConn.RemotePeer.Bitfield.Set(piece)
+
 	// I have this piece, do nothing
-	if p.Bitfield.IsSet(int(*piece)) {
+	if p.Bitfield.IsSet(piece) {
 		return
 	}
 
-	// if we got here, we need this piece
+	// 6.3.7 a peer receiving this message MUST send an interested
+	// message to the sender if indeed it lacks the piece announced.
 	m, err := Interested()
 	if err != nil {
 		w.Close()
 	}
 	w.Write(m)
-	// send a request for it
-	out, err := RequestMsg(pce, 0, int(p.MetaInfo.Info.PieceLength))
-	if err != nil {
-		return
-	}
-	w.Write(out)
 }
 
 func (p *Peer) FlushRequests(pc *PeerConn) error {
 	for _, r := range pc.RequestQueue {
 		out := make([]byte, r.block_len)
 		offset := (int(p.MetaInfo.Info.PieceLength) * r.piece) + r.block_off
-		n, err := p.File.ReadAt(out, int64(offset))
+		n, err := p.Chunker.GetFile().ReadAt(out, int64(offset))
 		if err == io.EOF {
 			out = out[:n]
 		}
@@ -293,6 +291,9 @@ func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 		return
 	}
 	p.Bitfield.Set(int(*piece))
+	for _, pc := range p.PeerConns {
+		p.SendHave(pc, int(*piece))
+	}
 	p.BitfieldNotify <- r.PeerConn
 }
 func (p *Peer) CancelHandler(w ResponseWriter, r *Request) {
@@ -432,8 +433,8 @@ func (p *Peer) Fetch() error {
 			p.PeerConns[pc.RemotePeer.PeerId] = pc
 			p.tryPiece()
 		case <-tick:
-			//fmt.Println(p.PeerId, "                  ME\t", p.Bitfield)
 			/*
+				fmt.Println(p.PeerId, "                  ME\t", p.Bitfield)
 				for pc := range p.PeerConns {
 					peer := p.PeerConns[pc].RemotePeer
 					fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
@@ -568,7 +569,6 @@ type Peer struct {
 	Handshake      bool
 	MetaInfo       *MetaInfo
 	Bitfield       *Bitset
-	File           *os.File
 	Chunker        *chunker.Chunker
 	PeerConns      map[string]*PeerConn
 	BitfieldNotify chan *PeerConn
@@ -747,7 +747,7 @@ func (p *Peer) Serve(l net.Listener) error {
 	}
 }
 
-func NewPeer(meta *MetaInfo) *Peer {
+func NewPeer(meta *MetaInfo, out io.Writer) *Peer {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		if l, err = net.Listen("tcp6", "[::1]:0"); err != nil {
@@ -768,7 +768,8 @@ func NewPeer(meta *MetaInfo) *Peer {
 	c, err := chunker.NewChunker(
 		p.MetaInfo.PiecesList,
 		int(p.MetaInfo.Info.PieceLength),
-		int(p.MetaInfo.Info.Length))
+		int(p.MetaInfo.Info.Length),
+		out)
 	if err != nil {
 		panic(fmt.Sprintf("unable to create chunker"))
 	}

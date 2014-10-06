@@ -1,27 +1,75 @@
 package main
 
 import (
-	"bufio"
 	"crypto/sha1"
 	"fmt"
 	bencode "github.com/jackpal/bencode-go"
 	"github.com/polvi/bt"
 	"github.com/polvi/bt/bttest"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"sync"
 	"testing"
 )
 
+func TestChunkStream(t *testing.T) {
+	hasher := sha1.New()
+	meta, _ := bt.ReadTorrentMetaInfoFile("centos-6.4.img.bz2.torrent")
+	p1 := bt.NewPeer(meta, hasher)
+	defer p1.Close()
+	f, err := os.Open("centos-6.4.img.bz2")
+	defer f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Seek(5*p1.MetaInfo.Info.PieceLength, 0)
+	if _, err := io.Copy(p1.Chunker, f); err != nil {
+		t.Fatal(err)
+	}
+	p1.Chunker.Flush()
+	f2, _ := os.Open("centos-6.4.img.bz2")
+	defer f2.Close()
+	if _, err := io.Copy(p1.Chunker, f2); err != nil {
+		t.Fatal(err)
+	}
+	<-p1.Chunker.DoneNotify()
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
+		t.Fatal("copied file did not match")
+	}
+
+	hasher.Reset()
+
+	// this set tests a full io copy on a file
+	p1 = bt.NewPeer(meta, hasher)
+	f, err = os.Open("centos-6.4.img.bz2")
+	defer f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(p1.Chunker, f); err != nil {
+		t.Fatal(err)
+	}
+	<-p1.Chunker.DoneNotify()
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
+		t.Fatal("copied file did not match")
+	}
+
+}
+
 func TestTripleTorrent(t *testing.T) {
 	tracker := bttest.NewTracker()
 	defer tracker.Close()
 	meta, _ := bt.ReadTorrentMetaInfoFile("centos-6.4.img.bz2.torrent")
 	meta.Announce = tracker.URL
-	p1 := bt.NewPeer(meta)
-	p2 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p1 := bt.NewPeer(meta, out)
+	defer p1.Close()
+	p2 := bt.NewPeer(meta, out)
+	defer p2.Close()
 	p3, err := bttest.NewPeerWithData(meta, "centos-6.4.img.bz2")
+	defer p3.Close()
 	wg := new(sync.WaitGroup)
 	wg.Add(3)
 	if err != nil {
@@ -40,9 +88,24 @@ func TestTripleTorrent(t *testing.T) {
 		p3.Start()
 		wg.Done()
 	}()
-	<-p1.Chunker.DoneNotify()
-	<-p2.Chunker.DoneNotify()
-	<-p3.Chunker.DoneNotify()
+	f := <-p1.Chunker.DoneNotify()
+	hasher := sha1.New()
+	io.Copy(hasher, f)
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
+		t.Fatal("copied file did not match")
+	}
+	hasher.Reset()
+	f = <-p2.Chunker.DoneNotify()
+	io.Copy(hasher, f)
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
+		t.Fatal("copied file did not match")
+	}
+	hasher.Reset()
+	f = <-p3.Chunker.DoneNotify()
+	io.Copy(hasher, f)
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
+		t.Fatal("copied file did not match")
+	}
 	p1.ShutdownNotify <- true
 	p2.ShutdownNotify <- true
 	p3.ShutdownNotify <- true
@@ -53,7 +116,8 @@ func zTestTracker(t *testing.T) {
 	defer tracker.Close()
 	meta, err := bt.ReadTorrentMetaInfoFile("centos-6.4.img.bz2.torrent")
 	meta.Announce = tracker.URL
-	p1 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p1 := bt.NewPeer(meta, out)
 	u, err := p1.TrackerURL()
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +127,7 @@ func zTestTracker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2 := bt.NewPeer(meta)
+	p2 := bt.NewPeer(meta, out)
 	u, err = p2.TrackerURL()
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +166,8 @@ func zTestSimpleFile(t *testing.T) {
 	}
 	defer p4.Close()
 
-	p3 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p3 := bt.NewPeer(meta, out)
 	defer p3.Close()
 	wg.Add(1)
 	wg2 := new(sync.WaitGroup)
@@ -122,12 +187,12 @@ func zTestSimpleFile(t *testing.T) {
 func TestChunkerGetFile(t *testing.T) {
 	wg := new(sync.WaitGroup)
 	meta, err := bt.ReadTorrentMetaInfoFile("centos-6.4.img.bz2.torrent")
-	p1 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p1 := bt.NewPeer(meta, out)
 
 	wg.Add(1)
 	go func() {
-		<-p1.Chunker.DoneNotify()
-		f := p1.Chunker.GetFile()
+		f := <-p1.Chunker.DoneNotify()
 		hasher := sha1.New()
 		io.Copy(hasher, f)
 		if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
@@ -140,10 +205,8 @@ func TestChunkerGetFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := bufio.NewReaderSize(f, int(p1.MetaInfo.Info.PieceLength))
-	io.Copy(p1.Chunker, buf)
 
-	n, err := io.Copy(p1.Chunker, buf)
+	n, err := io.Copy(p1.Chunker, f)
 	if err != nil {
 		t.Fatalf("err: %v, read %d bytes\n", err, n)
 	}
@@ -151,14 +214,15 @@ func TestChunkerGetFile(t *testing.T) {
 }
 func TestChunkerWriter(t *testing.T) {
 	meta, err := bt.ReadTorrentMetaInfoFile("centos-6.4.img.bz2.torrent")
-	p1 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p1 := bt.NewPeer(meta, out)
 	defer p1.Close()
 
 	f, err := os.Open("centos-6.4.img.bz2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := io.Copy(p1.Chunker, bufio.NewReaderSize(f, int(p1.MetaInfo.Info.PieceLength)))
+	n, err := io.Copy(p1.Chunker, f)
 	if err != nil {
 		t.Fatalf("err: %v, read %d bytes\n", err, n)
 	}
@@ -169,10 +233,11 @@ func TestPeerHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p1 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p1 := bt.NewPeer(meta, out)
 	defer p1.Close()
 
-	p2 := bt.NewPeer(meta)
+	p2 := bt.NewPeer(meta, out)
 	defer p2.Close()
 
 	//	p1.Connect(p2.PeerAddr)
@@ -188,7 +253,8 @@ func TestPeerSend(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p1.Close()
-	p2 := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p2 := bt.NewPeer(meta, out)
 	defer p2.Close()
 
 	//	p1.Connect(p2.PeerAddr)

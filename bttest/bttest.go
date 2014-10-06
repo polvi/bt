@@ -5,16 +5,17 @@ import (
 	"bytes"
 	"github.com/polvi/bt"
 	"io"
+	"io/ioutil"
 	"os"
 )
 
 func NewPeerWithData(meta *bt.MetaInfo, filename string) (*bt.Peer, error) {
-	p := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p := bt.NewPeer(meta, out)
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
-	p.File = f
 	for i := 0; i < meta.NumPieces; i++ {
 		p.Bitfield.Set(i)
 	}
@@ -23,12 +24,12 @@ func NewPeerWithData(meta *bt.MetaInfo, filename string) (*bt.Peer, error) {
 	return p, nil
 }
 func NewPeerWithDataPieces(meta *bt.MetaInfo, filename string, pieces int, piece_off int) (*bt.Peer, error) {
-	p := bt.NewPeer(meta)
+	out := ioutil.Discard
+	p := bt.NewPeer(meta, out)
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
-	p.File = f
 	for i := piece_off; i < piece_off+pieces; i++ {
 		p.Bitfield.Set(i)
 	}
