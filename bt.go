@@ -285,12 +285,11 @@ func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 		return
 	}
 	// downloaded bytes accounting
-	p.downloaded += n
+	p.downloaded += len(block_data)
 	p.bytesLeft -= n
 	if p.bytesLeft < 0 {
 		panic("got negative bytes left")
 	}
-	//	p.Bitfield.Set(int(*piece))
 	for _, pc := range p.PeerConns {
 		p.SendHave(pc, int(*piece))
 	}
@@ -598,11 +597,12 @@ func (p *Peer) TrackerURL(event string) (string, error) {
 	q := u.Query()
 	q.Add("info_hash", p.MetaInfo.InfoHash)
 	q.Add("peer_id", p.PeerId)
-	_, port, err := net.SplitHostPort(p.PeerAddr)
+	ip, port, err := net.SplitHostPort(p.PeerAddr)
 	if err != nil {
 		return "", err
 	}
 	q.Add("port", port)
+	q.Add("ip", ip)
 	// XXX This is a base ten integer value. It denotes the total amount of bytes that the peer has uploaded in the swarm since it sent the "started" event to the tracker. This key is REQUIRED.
 	q.Add("uploaded", strconv.Itoa(p.uploaded))
 	// XXX This is a base ten integer value. It denotes the total amount of bytes that the peer has downloaded in the swarm since it sent the "started" event to the tracker. This key is REQUIRED.
@@ -817,6 +817,7 @@ func (p *Peer) Start() error {
 	if err != nil {
 		return err
 	}
+	//fmt.Println(tr.Peers)
 	tick := time.Tick(time.Second * time.Duration(tr.Interval))
 	for {
 		select {
@@ -835,6 +836,7 @@ func (p *Peer) Start() error {
 			*/
 		case <-tick:
 			_, err := p.TrackerUpdate("")
+			//fmt.Println(tr.Peers)
 			if err != nil {
 				return err
 			}

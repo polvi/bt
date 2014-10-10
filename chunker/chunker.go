@@ -86,26 +86,26 @@ func (c *Chunker) Write(p []byte) (n int, err error) {
 	if c.chunkSize >= c.fileSize && c.fileSize == len(c.buf) {
 		n, err = c.Apply(p)
 		if err != nil {
+			fmt.Println("1")
 			return n, err
 		}
-		c.bytes_left -= n
 		return len(p), err
 	}
 	for c.bytes_left > 0 && len(c.buf) > c.chunkSize {
 		b := c.buf[:c.chunkSize]
 		n, err = c.Apply(b)
 		if err != nil {
+			fmt.Println("2")
 			return n, err
 		}
 		c.buf = c.buf[c.chunkSize:]
-		c.bytes_left -= c.chunkSize
 	}
 	if c.bytes_left < c.chunkSize && len(c.buf) == c.bytes_left {
-		n, err = c.Apply(p)
+		n, err = c.Apply(c.buf)
 		if err != nil {
 			return n, err
 		}
-		c.bytes_left -= len(c.buf)
+		c.buf = []byte{}
 		return len(p), nil
 	}
 	return len(p), nil
@@ -115,7 +115,6 @@ func (c *Chunker) Flush() (err error) {
 	if err != nil {
 		return err
 	}
-	c.bytes_left -= len(c.buf)
 	c.buf = []byte{}
 	return nil
 }
@@ -138,6 +137,7 @@ func (c *Chunker) findChunk(hash string) (*Chunk, int, error) {
 func (c *Chunker) GetBitfield() *bitset.Bitset {
 	return c.bitfield
 }
+
 func (c *Chunker) Apply(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -162,9 +162,10 @@ func (c *Chunker) Apply(b []byte) (int, error) {
 	}
 	chunk.applied = true
 	c.bitfield.Set(piece)
+	c.bytes_left -= n
 
-	// XXX: I think there is a race between here and above
 	c.chunksDone += 1
+	// XXX: I think there is a race between here and above
 	if c.nextWritePiece == piece {
 		_, err := c.out.Write(b)
 		if err != nil {

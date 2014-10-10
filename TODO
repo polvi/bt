@@ -2,3 +2,4 @@
   http://jonas.nitro.dk/bittorrent/bittorrent-rfc.html
 
 * Benchmark handlers and see if binary serialization is as fast as it could be
+* Fix races in chunker/chunker.go XXX
