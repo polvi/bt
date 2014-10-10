@@ -362,7 +362,7 @@ func (p *Peer) Connect(peers ...*Peer) error {
 func (p *Peer) NewPeerConn(conn net.Conn, id string) *PeerConn {
 	return &PeerConn{
 		Conn:         conn,
-		RemotePeer:   &Peer{PeerId: id, Bitfield: bitset.NewBitset(p.MetaInfo.NumPieces)},
+		RemotePeer:   &RemotePeer{PeerId: id, Bitfield: bitset.NewBitset(p.MetaInfo.NumPieces)},
 		Choked:       true,
 		Interested:   false,
 		RequestQueue: make(map[string]RequestQueueMsg),
@@ -442,12 +442,14 @@ func (p *Peer) Fetch() error {
 			p.PeerConns[pc.RemotePeer.PeerId] = pc
 			p.tryPiece()
 		case <-tick:
-			fmt.Println(p.PeerId, "                  ME\t", p.Chunker.GetBitfield())
-			for pc := range p.PeerConns {
-				peer := p.PeerConns[pc].RemotePeer
-				fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
-			}
-			fmt.Printf("dl: %d, up: %d, left: %d\n", p.downloaded, p.uploaded, p.bytesLeft)
+			/*
+				fmt.Println(p.PeerId, "                  ME\t", p.Chunker.GetBitfield())
+				for pc := range p.PeerConns {
+					peer := p.PeerConns[pc].RemotePeer
+					fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
+				}
+				fmt.Printf("dl: %d, up: %d, left: %d\n", p.downloaded, p.uploaded, p.bytesLeft)
+			*/
 		}
 	}
 }
@@ -565,7 +567,7 @@ func Cancel(pi int, bo int, bl int) ([]byte, error) {
 type PeerConn struct {
 	handshake_sent bool
 	Conn           net.Conn
-	RemotePeer     *Peer
+	RemotePeer     *RemotePeer
 	Choked         bool
 	Interested     bool
 	RequestQueue   map[string]RequestQueueMsg
@@ -576,7 +578,6 @@ type Peer struct {
 	Listener       net.Listener
 	Handshake      bool
 	MetaInfo       *MetaInfo
-	Bitfield       *bitset.Bitset
 	Chunker        *chunker.Chunker
 	PeerConns      map[string]*PeerConn
 	BitfieldNotify chan *PeerConn
@@ -586,6 +587,10 @@ type Peer struct {
 	uploaded       int
 	downloaded     int
 	bytesLeft      int
+}
+type RemotePeer struct {
+	PeerId   string
+	Bitfield *bitset.Bitset
 }
 
 func (p *Peer) TrackerURL(event string) (string, error) {
