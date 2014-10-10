@@ -57,9 +57,9 @@ func main() {
 		ch := make(chan os.Signal)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 		<-ch
-		p.ShutdownNotify <- true
 		f.Close()
 		os.Remove(out)
+		p.ShutdownNotify <- true
 	}()
 	// graceful shutdown on file being done
 	go func() {

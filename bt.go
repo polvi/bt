@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/polvi/bt/bitset"
 	"github.com/polvi/bt/chunker"
 	"io"
 	"io/ioutil"
@@ -173,7 +174,7 @@ func (p *Peer) HaveHandler(w ResponseWriter, r *Request) {
 	}
 	piece := int(*pce)
 	// validate index within bounds, drop conn otherwise
-	if !p.Bitfield.InRange(piece) {
+	if !p.Chunker.GetBitfield().InRange(piece) {
 		r.PeerConn.Conn.Close()
 	}
 
@@ -181,7 +182,7 @@ func (p *Peer) HaveHandler(w ResponseWriter, r *Request) {
 	r.PeerConn.RemotePeer.Bitfield.Set(piece)
 
 	// I have this piece, do nothing
-	if p.Bitfield.IsSet(piece) {
+	if p.Chunker.GetBitfield().IsSet(piece) {
 		return
 	}
 
@@ -215,7 +216,7 @@ func (p *Peer) FlushRequests(pc *PeerConn) error {
 }
 
 func (p *Peer) BitfieldHandler(w ResponseWriter, r *Request) {
-	bs, err := NewBitsetFromBytes(p.MetaInfo.NumPieces, r.Payload)
+	bs, err := bitset.NewBitsetFromBytes(p.MetaInfo.NumPieces, r.Payload)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -289,7 +290,7 @@ func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 	if p.bytesLeft < 0 {
 		panic("got negative bytes left")
 	}
-	p.Bitfield.Set(int(*piece))
+	//	p.Bitfield.Set(int(*piece))
 	for _, pc := range p.PeerConns {
 		p.SendHave(pc, int(*piece))
 	}
@@ -361,7 +362,7 @@ func (p *Peer) Connect(peers ...*Peer) error {
 func (p *Peer) NewPeerConn(conn net.Conn, id string) *PeerConn {
 	return &PeerConn{
 		Conn:         conn,
-		RemotePeer:   &Peer{PeerId: id, Bitfield: NewBitset(p.MetaInfo.NumPieces)},
+		RemotePeer:   &Peer{PeerId: id, Bitfield: bitset.NewBitset(p.MetaInfo.NumPieces)},
 		Choked:       true,
 		Interested:   false,
 		RequestQueue: make(map[string]RequestQueueMsg),
@@ -407,7 +408,7 @@ func Interested() ([]byte, error) {
 }
 func (p *Peer) RarestFirst() int {
 	// this needs to be smarter
-	return p.Bitfield.FindNextClear(0)
+	return p.Chunker.GetBitfield().FindNextClear(0)
 }
 func (p *Peer) tryPiece() {
 	piece := p.RarestFirst()
@@ -441,14 +442,12 @@ func (p *Peer) Fetch() error {
 			p.PeerConns[pc.RemotePeer.PeerId] = pc
 			p.tryPiece()
 		case <-tick:
-			/*
-				fmt.Println(p.PeerId, "                  ME\t", p.Bitfield)
-				for pc := range p.PeerConns {
-					peer := p.PeerConns[pc].RemotePeer
-					fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
-				}
-				fmt.Printf("dl: %d, up: %d, left: %d\n", p.downloaded, p.uploaded, p.bytesLeft)
-			*/
+			fmt.Println(p.PeerId, "                  ME\t", p.Chunker.GetBitfield())
+			for pc := range p.PeerConns {
+				peer := p.PeerConns[pc].RemotePeer
+				fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
+			}
+			fmt.Printf("dl: %d, up: %d, left: %d\n", p.downloaded, p.uploaded, p.bytesLeft)
 		}
 	}
 }
@@ -461,7 +460,7 @@ func (p *Peer) SendUnchoke(pc *PeerConn) error {
 	return err
 }
 func (p *Peer) SendBitfield(pc *PeerConn) error {
-	bf := p.Bitfield.Bytes()
+	bf := p.Chunker.GetBitfield().Bytes()
 	m, err := message(BITFIELD, bf)
 
 	if err != nil {
@@ -577,7 +576,7 @@ type Peer struct {
 	Listener       net.Listener
 	Handshake      bool
 	MetaInfo       *MetaInfo
-	Bitfield       *Bitset
+	Bitfield       *bitset.Bitset
 	Chunker        *chunker.Chunker
 	PeerConns      map[string]*PeerConn
 	BitfieldNotify chan *PeerConn
@@ -786,7 +785,7 @@ func NewPeer(meta *MetaInfo, out io.Writer) *Peer {
 	p.PeerId = fmt.Sprintf("gobt-%s", i[:15])
 	p.MetaInfo = meta
 
-	p.Bitfield = NewBitset(meta.NumPieces)
+	//	p.Bitfield = bitset.NewBitset(meta.NumPieces)
 	c, err := chunker.NewChunker(
 		p.MetaInfo.PiecesList,
 		int(p.MetaInfo.Info.PieceLength),

@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"github.com/polvi/bt/bitset"
 	"hash"
 	"io"
 	"io/ioutil"
@@ -13,6 +14,7 @@ import (
 type Chunker struct {
 	Done           chan *os.File
 	hasher         hash.Hash
+	bitfield       *bitset.Bitset
 	chunks         []*Chunk
 	chunksDone     int
 	chunksTotal    int
@@ -59,6 +61,7 @@ func NewChunker(hashList []string, chunkSize int, fileSize int, out io.Writer) (
 	c.buf = []byte{}
 	c.bytes_left = c.fileSize
 	c.Done = make(chan *os.File, 1)
+	c.bitfield = bitset.NewBitset(len(hashList))
 	return c, nil
 }
 
@@ -125,12 +128,15 @@ func (c *Chunker) GetFile() *os.File {
 }
 
 func (c *Chunker) findChunk(hash string) (*Chunk, int, error) {
-	for i, c := range c.chunks {
-		if c.hash == hash && !c.applied {
-			return c, i, nil
+	for i, chunk := range c.chunks {
+		if chunk.hash == hash {
+			return chunk, i, nil
 		}
 	}
 	return nil, 0, errors.New("unable to find chunk with hash " + hash)
+}
+func (c *Chunker) GetBitfield() *bitset.Bitset {
+	return c.bitfield
 }
 func (c *Chunker) Apply(b []byte) (int, error) {
 	if len(b) == 0 {
@@ -140,13 +146,13 @@ func (c *Chunker) Apply(b []byte) (int, error) {
 	c.hasher.Write(b)
 	sum := string(c.hasher.Sum(nil))
 
+	// XXX I think there is a race here
 	chunk, piece, err := c.findChunk(sum)
 	if err != nil {
 		fmt.Println(err)
 		return 0, errors.New(fmt.Sprintf("got unknown chunk, size %d, chunk size %d", len(b), c.chunkSize))
 	}
-	// XXX I think there is a race here
-	if chunk.applied {
+	if c.bitfield.IsSet(piece) {
 		// we already wrote it, no op
 		return 0, nil
 	}
@@ -155,6 +161,8 @@ func (c *Chunker) Apply(b []byte) (int, error) {
 		return n, err
 	}
 	chunk.applied = true
+	c.bitfield.Set(piece)
+
 	// XXX: I think there is a race between here and above
 	c.chunksDone += 1
 	if c.nextWritePiece == piece {

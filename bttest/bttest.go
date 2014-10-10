@@ -16,9 +16,6 @@ func NewPeerWithData(meta *bt.MetaInfo, filename string) (*bt.Peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < meta.NumPieces; i++ {
-		p.Bitfield.Set(i)
-	}
 	buf := bufio.NewReaderSize(f, int(p.MetaInfo.Info.PieceLength))
 	io.Copy(p.Chunker, buf)
 	return p, nil
@@ -29,9 +26,6 @@ func NewPeerWithDataPieces(meta *bt.MetaInfo, filename string, pieces int, piece
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
-	}
-	for i := piece_off; i < piece_off+pieces; i++ {
-		p.Bitfield.Set(i)
 	}
 	f.Seek(p.MetaInfo.Info.PieceLength*int64(piece_off), 0)
 	buf := bufio.NewReaderSize(f, int(p.MetaInfo.Info.PieceLength))
