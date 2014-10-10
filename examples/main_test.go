@@ -3,12 +3,10 @@ package main
 import (
 	"crypto/sha1"
 	"fmt"
-	bencode "github.com/jackpal/bencode-go"
 	"github.com/polvi/bt"
 	"github.com/polvi/bt/bttest"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"sync"
 	"testing"
@@ -90,61 +88,32 @@ func TestTripleTorrent(t *testing.T) {
 	}()
 	f := <-p1.Chunker.DoneNotify()
 	hasher := sha1.New()
-	io.Copy(hasher, f)
+	if _, err = io.Copy(hasher, f); err != nil {
+		t.Fatal(err)
+	}
 	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
 		t.Fatal("copied file did not match")
 	}
 	hasher.Reset()
 	f = <-p2.Chunker.DoneNotify()
-	io.Copy(hasher, f)
+	if _, err = io.Copy(hasher, f); err != nil {
+		t.Fatal(err)
+	}
 	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
-		t.Fatal("copied file did not match")
+		t.Fatal("copied file did not match", f)
 	}
 	hasher.Reset()
 	f = <-p3.Chunker.DoneNotify()
-	io.Copy(hasher, f)
+	if _, err = io.Copy(hasher, f); err != nil {
+		t.Fatal(err)
+	}
 	if fmt.Sprintf("%x", hasher.Sum(nil)) != "fc76f732918299cd3e5156a02beb3b42e8eb233e" {
-		t.Fatal("copied file did not match")
+		t.Fatal("copied file did not match", f)
 	}
 	p1.ShutdownNotify <- true
 	p2.ShutdownNotify <- true
 	p3.ShutdownNotify <- true
 	wg.Wait()
-}
-func zTestTracker(t *testing.T) {
-	tracker := bttest.NewTracker()
-	defer tracker.Close()
-	meta, err := bt.ReadTorrentMetaInfoFile("centos-6.4.img.bz2.torrent")
-	meta.Announce = tracker.URL
-	out := ioutil.Discard
-	p1 := bt.NewPeer(meta, out)
-	u, err := p1.TrackerURL()
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := http.Get(u)
-	defer res.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	p2 := bt.NewPeer(meta, out)
-	u, err = p2.TrackerURL()
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err = http.Get(u)
-	defer res.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := new(bt.TrackerResponse)
-	err = bencode.Unmarshal(res.Body, tr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(tr.Peers) != 2 {
-		t.Fatalf("expected 2 peers, got %d", len(tr.Peers))
-	}
 }
 func zTestSimpleFile(t *testing.T) {
 	wg := new(sync.WaitGroup)

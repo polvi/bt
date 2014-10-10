@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -245,6 +246,7 @@ func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
 	n, err := p.Chunker.GetFile().ReadAt(out, int64(offset))
 	if err == io.EOF {
 		out = out[:n]
+		fmt.Println("short read", *piece, n)
 	}
 	if err != nil && err != io.EOF {
 		fmt.Println("error reading file", err)
@@ -256,16 +258,8 @@ func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
 		return
 	}
 	w.Write(out)
-	/*
-		} else {
-			r.PeerConn.RequestQueue[fmt.Sprintf("%d,%d,%d")] = RequestQueueMsg{
-				piece:     int(*piece),
-				block_off: int(*block_off),
-				block_len: int(*block_len),
-			}
-
-		}
-	*/
+	// uploaded bytes accounting
+	p.uploaded += n
 }
 func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 	rr := bytes.NewReader(r.Payload)
@@ -283,12 +277,17 @@ func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 	if err != nil {
 		fmt.Println(err)
 		return
-
 	}
-	_, err = p.Chunker.Apply(block_data)
+	n, err := p.Chunker.Apply(block_data)
 	if err != nil {
 		fmt.Println(err)
 		return
+	}
+	// downloaded bytes accounting
+	p.downloaded += n
+	p.bytesLeft -= n
+	if p.bytesLeft < 0 {
+		panic("got negative bytes left")
 	}
 	p.Bitfield.Set(int(*piece))
 	for _, pc := range p.PeerConns {
@@ -315,6 +314,9 @@ func (p *Peer) CancelHandler(w ResponseWriter, r *Request) {
 		return
 	}
 	delete(r.PeerConn.RequestQueue, fmt.Sprintf("%d,%d,%d"))
+}
+func (p *Peer) NoOpHandler(w ResponseWriter, r *Request) {
+
 }
 
 type RequestQueueMsg struct {
@@ -415,7 +417,13 @@ func (p *Peer) tryPiece() {
 	for _, pc := range p.PeerConns {
 		if pc.RemotePeer.Bitfield.IsSet(piece) {
 			pc.SendInterested()
-			pc.SendRequest(piece, 0, int(p.MetaInfo.Info.PieceLength))
+			if p.MetaInfo.Info.Length < p.MetaInfo.Info.PieceLength {
+				pc.SendRequest(piece, 0, int(p.MetaInfo.Info.Length))
+			} else if p.bytesLeft < int(p.MetaInfo.Info.PieceLength) {
+				pc.SendRequest(piece, 0, p.bytesLeft)
+			} else {
+				pc.SendRequest(piece, 0, int(p.MetaInfo.Info.PieceLength))
+			}
 			return
 		}
 	}
@@ -439,6 +447,7 @@ func (p *Peer) Fetch() error {
 					peer := p.PeerConns[pc].RemotePeer
 					fmt.Println(p.PeerId, peer.PeerId, "\t", peer.Bitfield)
 				}
+				fmt.Printf("dl: %d, up: %d, left: %d\n", p.downloaded, p.uploaded, p.bytesLeft)
 			*/
 		}
 	}
@@ -575,9 +584,12 @@ type Peer struct {
 	PeerNotify     chan *PeerConn
 	PieceNotify    chan int
 	ShutdownNotify chan bool
+	uploaded       int
+	downloaded     int
+	bytesLeft      int
 }
 
-func (p *Peer) TrackerURL() (string, error) {
+func (p *Peer) TrackerURL(event string) (string, error) {
 	u := new(url.URL)
 	q := u.Query()
 	q.Add("info_hash", p.MetaInfo.InfoHash)
@@ -588,9 +600,14 @@ func (p *Peer) TrackerURL() (string, error) {
 	}
 	q.Add("port", port)
 	// XXX This is a base ten integer value. It denotes the total amount of bytes that the peer has uploaded in the swarm since it sent the "started" event to the tracker. This key is REQUIRED.
-	q.Add("uploaded", "0")
+	q.Add("uploaded", strconv.Itoa(p.uploaded))
 	// XXX This is a base ten integer value. It denotes the total amount of bytes that the peer has downloaded in the swarm since it sent the "started" event to the tracker. This key is REQUIRED.
-	q.Add("left", fmt.Sprintf("%v", p.MetaInfo.Info.Length))
+	q.Add("downloaded", strconv.Itoa(p.downloaded))
+	q.Add("left", strconv.Itoa(p.bytesLeft))
+	if event != "" {
+		q.Add("event", event)
+	}
+	q.Add("numwant", "100")
 	u.RawQuery = q.Encode()
 	return fmt.Sprintf("%s%s", p.MetaInfo.Announce, u), nil
 }
@@ -664,6 +681,8 @@ func (r *Request) String() string {
 		m = "piece"
 	case CANCEL:
 		m = "cancel"
+	default:
+		m = fmt.Sprintf("unknown [%d]", r.Id)
 	}
 
 	return fmt.Sprintf("-> %s %s %v bytes", r.PeerConn.RemotePeer.PeerId, m, len(r.Payload))
@@ -689,6 +708,9 @@ func (p *Peer) FindHandler(r *Request) (HandlerFunc, error) {
 		return p.PieceHandler, nil
 	case CANCEL:
 		return p.CancelHandler, nil
+	case -1:
+		// keep alive
+		return p.NoOpHandler, nil
 	}
 	return nil, errors.New("unknown message")
 }
@@ -761,7 +783,7 @@ func NewPeer(meta *MetaInfo, out io.Writer) *Peer {
 		panic(fmt.Sprintf("failed to get peerid: %v", err))
 	}
 	i := fmt.Sprintf("%x", id)
-	p.PeerId = i[:20]
+	p.PeerId = fmt.Sprintf("gobt-%s", i[:15])
 	p.MetaInfo = meta
 
 	p.Bitfield = NewBitset(meta.NumPieces)
@@ -779,12 +801,15 @@ func NewPeer(meta *MetaInfo, out io.Writer) *Peer {
 	p.PieceNotify = make(chan int)
 	p.BitfieldNotify = make(chan *PeerConn)
 	p.ShutdownNotify = make(chan bool)
+	p.uploaded = 0
+	p.downloaded = 0
+	p.bytesLeft = int(meta.Info.Length)
 	go p.Serve(p.Listener)
 	return p
 }
 func (p *Peer) Start() error {
 	go p.Fetch()
-	tr, err := p.TrackerUpdate()
+	tr, err := p.TrackerUpdate("started")
 	if err != nil {
 		return err
 	}
@@ -792,9 +817,20 @@ func (p *Peer) Start() error {
 	for {
 		select {
 		case <-p.ShutdownNotify:
+			_, err := p.TrackerUpdate("stopped")
+			if err != nil {
+				return err
+			}
 			return nil
+			/*
+				case <-p.Chunker.DoneNotify():
+					_, err := p.TrackerUpdate("completed")
+					if err != nil {
+						return err
+					}
+			*/
 		case <-tick:
-			_, err := p.TrackerUpdate()
+			_, err := p.TrackerUpdate("")
 			if err != nil {
 				return err
 			}
@@ -812,8 +848,8 @@ type TrackerResponse struct {
 	Peers    []TrackerPeer "peers"
 }
 
-func (p *Peer) TrackerUpdate() (*TrackerResponse, error) {
-	u, err := p.TrackerURL()
+func (p *Peer) TrackerUpdate(event string) (*TrackerResponse, error) {
+	u, err := p.TrackerURL(event)
 	if err != nil {
 		return nil, err
 	}
@@ -835,7 +871,7 @@ func (p *Peer) TrackerUpdate() (*TrackerResponse, error) {
 			rp := &Peer{
 				PeerAddr: fmt.Sprintf("%s:%d", peer.Ip, peer.Port),
 			}
-			p.Connect(rp)
+			go p.Connect(rp)
 		}
 	}
 	return tr, nil
@@ -905,7 +941,6 @@ type MetaInfo struct {
 
 // Open .torrent file, un-bencode it and load them into MetaInfo struct.
 func ReadTorrentMetaInfoFile(fileNameWithPath string) (meta *MetaInfo, err error) {
-	var metaInfo MetaInfo
 	// Check exntension.
 	if fileExt := filepath.Ext(fileNameWithPath); fileExt != ".torrent" {
 		return nil, errors.New("file extention required to be .torrent")
@@ -917,9 +952,12 @@ func ReadTorrentMetaInfoFile(fileNameWithPath string) (meta *MetaInfo, err error
 		return nil, err
 	}
 	defer file.Close()
-
+	return ReadTorrentMetaInfo(file)
+}
+func ReadTorrentMetaInfo(r io.Reader) (meta *MetaInfo, err error) {
+	var metaInfo MetaInfo
 	// Decode bencoded metainfo file.
-	fileMetaData, err := bencode.Decode(file)
+	fileMetaData, err := bencode.Decode(r)
 	if err != nil {
 		return nil, err
 	}

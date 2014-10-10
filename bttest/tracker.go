@@ -55,12 +55,16 @@ func announceHandler(w http.ResponseWriter, r *http.Request, s *trackerStatus) {
 		if left, err := strconv.Atoi(v.Get("left")); err == nil {
 			t.left = left
 		}
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			fmt.Fprintf(w, "error parsing host "+err.Error())
-			return
+		if ip := v.Get("ip"); len(ip) > 0 {
+			t.ip = ip
+		} else {
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				fmt.Fprintf(w, "error parsing host "+err.Error())
+				return
+			}
+			t.ip = host
 		}
-		t.ip = host
 		s.peers[v.Get("info_hash")][v.Get("peer_id")] = t
 	}
 	tr := TrackerResponse{Interval: 1}

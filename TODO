@@ -1,4 +1,4 @@
 * Implement the choked/unchoked interested/uninterested logic from 6.3.1:
   http://jonas.nitro.dk/bittorrent/bittorrent-rfc.html
 
-
+* Benchmark handlers and see if binary serialization is as fast as it could be

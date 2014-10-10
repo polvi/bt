@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
-	"github.com/polvi/bttp/bt"
 	"hash"
 	"io"
 	"io/ioutil"
@@ -14,10 +13,10 @@ import (
 type Chunker struct {
 	Done           chan *os.File
 	hasher         hash.Hash
-	t              bt.Torrent
+	chunks         []*Chunk
+	chunksDone     int
+	chunksTotal    int
 	file           *os.File
-	hashMap        map[string]int
-	doneMap        map[int]bool
 	chunkSize      int
 	fileSize       int
 	nextWritePiece int
@@ -27,18 +26,31 @@ type Chunker struct {
 	bytes_left int
 }
 
+type Chunk struct {
+	hash    string
+	applied bool
+}
+
 func NewChunker(hashList []string, chunkSize int, fileSize int, out io.Writer) (*Chunker, error) {
 	c := new(Chunker)
 	file, err := ioutil.TempFile("", "chunker")
 	if err != nil {
 		return nil, err
 	}
-	file.Truncate(int64(fileSize))
+	err = file.Truncate(int64(fileSize))
+	if err != nil {
+		return nil, err
+	}
 	c.file = file
 	c.hasher = sha1.New()
-	c.hashMap = make(map[string]int)
+	c.chunksDone = 0
+	c.chunksTotal = len(hashList)
+	c.chunks = make([]*Chunk, len(hashList))
 	for i, h := range hashList {
-		c.hashMap[h] = i
+		c.chunks[i] = &Chunk{
+			hash:    h,
+			applied: false,
+		}
 	}
 	c.chunkSize = chunkSize
 	c.fileSize = fileSize
@@ -47,7 +59,6 @@ func NewChunker(hashList []string, chunkSize int, fileSize int, out io.Writer) (
 	c.buf = []byte{}
 	c.bytes_left = c.fileSize
 	c.Done = make(chan *os.File, 1)
-	c.doneMap = make(map[int]bool)
 	return c, nil
 }
 
@@ -112,41 +123,49 @@ func (c *Chunker) DoneNotify() chan *os.File {
 func (c *Chunker) GetFile() *os.File {
 	return c.file
 }
+
+func (c *Chunker) findChunk(hash string) (*Chunk, int, error) {
+	for i, c := range c.chunks {
+		if c.hash == hash && !c.applied {
+			return c, i, nil
+		}
+	}
+	return nil, 0, errors.New("unable to find chunk with hash " + hash)
+}
 func (c *Chunker) Apply(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
 	c.hasher.Reset()
 	c.hasher.Write(b)
-	sum := c.hasher.Sum(nil)
+	sum := string(c.hasher.Sum(nil))
 
-	// returns zero bytes if it could not verify the data
-	i, ok := c.hashMap[string(sum)]
-	if !ok {
+	chunk, piece, err := c.findChunk(sum)
+	if err != nil {
+		fmt.Println(err)
 		return 0, errors.New(fmt.Sprintf("got unknown chunk, size %d, chunk size %d", len(b), c.chunkSize))
 	}
-	if _, ok := c.doneMap[i]; ok {
-		// we've already applied this one, no error
-		return len(b), nil
+	// XXX I think there is a race here
+	if chunk.applied {
+		// we already wrote it, no op
+		return 0, nil
 	}
-	// does it need to be sync'd?
-	n, err := c.file.WriteAt(b, int64(i*c.chunkSize))
+	n, err := c.file.WriteAt(b, int64(piece*c.chunkSize))
 	if err != nil {
 		return n, err
 	}
-	c.doneMap[i] = true
-	if len(c.doneMap) == len(c.hashMap) {
-		c.Done <- c.file
-	}
-	if c.nextWritePiece == i {
+	chunk.applied = true
+	// XXX: I think there is a race between here and above
+	c.chunksDone += 1
+	if c.nextWritePiece == piece {
 		_, err := c.out.Write(b)
 		if err != nil {
 			return n, err
 		}
 		c.nextWritePiece++
 		j := c.nextWritePiece
-		for j = i; j < len(c.hashMap); j++ {
-			if _, ok := c.doneMap[j]; !ok {
+		for j = piece; j < len(c.chunks); j++ {
+			if chunk := c.chunks[j]; !chunk.applied {
 				break
 			}
 		}
@@ -166,6 +185,10 @@ func (c *Chunker) Apply(b []byte) (int, error) {
 			}
 		}
 		c.nextWritePiece = j
+	}
+	if c.chunksDone == c.chunksTotal {
+		c.file.Sync()
+		c.Done <- c.file
 	}
 	return n, nil
 }
