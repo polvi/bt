@@ -1,5 +1,6 @@
 * Implement the choked/unchoked interested/uninterested logic from 6.3.1:
   http://jonas.nitro.dk/bittorrent/bittorrent-rfc.html
-
 * Benchmark handlers and see if binary serialization is as fast as it could be
-* Fix races in chunker/chunker.go XXX
+* Does not support multi-file at all, this was built mainly for S3 torrents
+* Right now it downloads entire pieces at a time, when it should be downloading
+  16kb "blocks" within the piece, then verifying the piece all at once. 

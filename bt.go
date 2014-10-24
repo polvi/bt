@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -147,20 +148,21 @@ func (h *Handshake) MarshalBinary() (data []byte, err error) {
 
 const HANDSHAKE_BYTES int = 68
 
+//  When a peer chokes the client, it is a notification that no requests will be answered until the client is unchoked.
 func (p *Peer) ChokeHandler(w ResponseWriter, r *Request) {
-	r.PeerConn.Choked = true
+	r.PeerConn.PeerChoking = true
+	//  it should consider all pending (unanswered) requests to be discarded by the remote peer.
 }
 
 func (p *Peer) UnchokeHandler(w ResponseWriter, r *Request) {
-	r.PeerConn.Choked = false
-	p.FlushRequests(r.PeerConn)
+	r.PeerConn.PeerChoking = false
+	//	p.FlushRequests(r.PeerConn)
 }
 func (p *Peer) InterestedHandler(w ResponseWriter, r *Request) {
-	r.PeerConn.Interested = true
+	r.PeerConn.PeerInterested = true
 }
 func (p *Peer) UninterestedHandler(w ResponseWriter, r *Request) {
-	r.PeerConn.Interested = false
-	r.PeerConn.RequestQueue = make(map[string]RequestQueueMsg)
+	r.PeerConn.PeerInterested = false
 }
 
 /*
@@ -196,7 +198,7 @@ func (p *Peer) HaveHandler(w ResponseWriter, r *Request) {
 }
 
 func (p *Peer) FlushRequests(pc *PeerConn) error {
-	for _, r := range pc.RequestQueue {
+	for r, _ := range pc.RequestQueue.m {
 		out := make([]byte, r.block_len)
 		offset := (int(p.MetaInfo.Info.PieceLength) * r.piece) + r.block_off
 		n, err := p.Chunker.GetFile().ReadAt(out, int64(offset))
@@ -226,6 +228,18 @@ func (p *Peer) BitfieldHandler(w ResponseWriter, r *Request) {
 }
 
 func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
+
+	// A block is uploaded by a client when the client is not choking a peer, and that peer is interested in the client.
+	// !AmChoking && PeerInterested
+	if r.PeerConn.AmChoking {
+		// peer you can't request anything! ignoring
+		fmt.Println("AmChoking peer- they can't request, ignoring")
+		return
+	}
+	if !r.PeerConn.PeerInterested {
+		fmt.Println("!pc.PeerConn.PeerInterested: request for something peer is not interested in. Client must send Interested first.")
+		return
+	}
 	rr := bytes.NewReader(r.Payload)
 	piece := new(int32)
 	if err := binary.Read(rr, binary.BigEndian, piece); err != nil {
@@ -247,37 +261,63 @@ func (p *Peer) RequestHandler(w ResponseWriter, r *Request) {
 	n, err := p.Chunker.GetFile().ReadAt(out, int64(offset))
 	if err == io.EOF {
 		out = out[:n]
-		fmt.Println("short read", *piece, n)
 	}
 	if err != nil && err != io.EOF {
 		fmt.Println("error reading file", err)
 		return
 	}
+	/*
+		rqm := RequestQueueMsg{piece: int(*piece),
+			block_off: int(*block_off),
+			block_len: int(*block_len),
+		}
+	*/
 	//	if !r.PeerConn.Choked {
 	out, err = PieceMsg(int(*piece), int(*block_off), out)
 	if err != nil {
 		return
 	}
+	/*
+		r.PeerConn.RequestQueue.Lock()
+		defer r.PeerConn.RequestQueue.Unlock()
+		r.PeerConn.RequestQueue.m[rqm] = true
+	*/
 	w.Write(out)
 	// uploaded bytes accounting
 	p.uploaded += n
 }
 func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
+	// A block is downloaded by the client when the client is interested in a peer, and that peer is not choking the client.
+	// if AmInterested && !PeerChoking
 	rr := bytes.NewReader(r.Payload)
 	piece := new(int32)
 	if err := binary.Read(rr, binary.BigEndian, piece); err != nil {
+		fmt.Println("1", err)
 		w.Close()
 		return
 	}
 	block_off := new(int32)
 	if err := binary.Read(rr, binary.BigEndian, block_off); err != nil {
+		fmt.Println("2")
 		w.Close()
 		return
 	}
 	block_data, err := ioutil.ReadAll(rr)
 	if err != nil {
+		fmt.Println("3")
 		fmt.Println(err)
 		return
+	}
+	rqm := RequestQueueMsg{piece: int(*piece),
+		block_off: int(*block_off),
+		block_len: len(block_data),
+	}
+
+	r.PeerConn.RequestQueue.RLock()
+	_, ok := r.PeerConn.RequestQueue.m[rqm]
+	r.PeerConn.RequestQueue.RUnlock()
+	if !ok {
+		fmt.Println("got piece that was not requested")
 	}
 	n, err := p.Chunker.Apply(block_data)
 	if err != nil {
@@ -296,7 +336,6 @@ func (p *Peer) PieceHandler(w ResponseWriter, r *Request) {
 	p.BitfieldNotify <- r.PeerConn
 }
 func (p *Peer) CancelHandler(w ResponseWriter, r *Request) {
-	// not sure what to do here
 	rr := bytes.NewReader(r.Payload)
 	piece := new(int32)
 	if err := binary.Read(rr, binary.BigEndian, piece); err != nil {
@@ -313,10 +352,15 @@ func (p *Peer) CancelHandler(w ResponseWriter, r *Request) {
 		w.Close()
 		return
 	}
-	delete(r.PeerConn.RequestQueue, fmt.Sprintf("%d,%d,%d"))
+	rqm := RequestQueueMsg{piece: int(*piece),
+		block_off: int(*block_off),
+		block_len: int(*block_len),
+	}
+	r.PeerConn.RequestQueue.Lock()
+	defer r.PeerConn.RequestQueue.Unlock()
+	delete(r.PeerConn.RequestQueue.m, rqm)
 }
 func (p *Peer) NoOpHandler(w ResponseWriter, r *Request) {
-
 }
 
 type RequestQueueMsg struct {
@@ -359,13 +403,16 @@ func (p *Peer) Connect(peers ...*Peer) error {
 }
 
 func (p *Peer) NewPeerConn(conn net.Conn, id string) *PeerConn {
-	return &PeerConn{
-		Conn:         conn,
-		RemotePeer:   &RemotePeer{PeerId: id, Bitfield: bitset.NewBitset(p.MetaInfo.NumPieces)},
-		Choked:       true,
-		Interested:   false,
-		RequestQueue: make(map[string]RequestQueueMsg),
+	pc := &PeerConn{
+		Conn:           conn,
+		RemotePeer:     &RemotePeer{PeerId: id, Bitfield: bitset.NewBitset(p.MetaInfo.NumPieces)},
+		AmChoking:      true,
+		AmInterested:   false,
+		PeerChoking:    true,
+		PeerInterested: false,
 	}
+	pc.RequestQueue.m = make(map[RequestQueueMsg]bool)
+	return pc
 }
 
 const (
@@ -457,6 +504,7 @@ func (p *Peer) SendUnchoke(pc *PeerConn) error {
 	if err != nil {
 		return err
 	}
+	pc.AmChoking = false
 	_, err = pc.Conn.Write(m)
 	return err
 }
@@ -475,16 +523,33 @@ func (pc *PeerConn) SendInterested() error {
 	if err != nil {
 		return err
 	}
+	pc.AmInterested = true
 	_, err = pc.Conn.Write(m)
 	return err
 }
 
 func (pc *PeerConn) SendRequest(piece int, block_off int, block_len int) error {
+	// if PeerChoking, The client should not attempt to send requests for blocks
+	rqm := RequestQueueMsg{piece: piece,
+		block_off: block_off,
+		block_len: block_len,
+	}
+	pc.RequestQueue.RLock()
+	_, ok := pc.RequestQueue.m[rqm]
+	pc.RequestQueue.RUnlock()
+	if ok {
+		// piece already requested, ignore sending again
+		return errors.New("already sent request")
+	}
 	m, err := RequestMsg(piece, block_off, block_len)
 	if err != nil {
 		return err
 	}
+	// not sure if I should unlock until after the data has been sent or not
+	pc.RequestQueue.Lock()
+	defer pc.RequestQueue.Unlock()
 	_, err = pc.Conn.Write(m)
+	pc.RequestQueue.m[rqm] = true
 	return err
 }
 
@@ -565,11 +630,16 @@ func Cancel(pi int, bo int, bl int) ([]byte, error) {
 
 type PeerConn struct {
 	handshake_sent bool
-	Conn           net.Conn
+	Conn           io.ReadWriteCloser
 	RemotePeer     *RemotePeer
-	Choked         bool
-	Interested     bool
-	RequestQueue   map[string]RequestQueueMsg
+	AmChoking      bool
+	AmInterested   bool
+	PeerChoking    bool
+	PeerInterested bool
+	RequestQueue   struct {
+		sync.RWMutex
+		m map[RequestQueueMsg]bool
+	}
 }
 type Peer struct {
 	PeerAddr       string
@@ -628,7 +698,7 @@ func (p *Peer) ReadHandshake(conn net.Conn) (h Handshake, err error) {
 	}
 	return h, nil
 }
-func (p *Peer) ReadRequest(pc *PeerConn) (req *Request, err error) {
+func ReadRequest(pc *PeerConn) (*Request, error) {
 	// if ml == 0, return
 	// if ml > 1, get payload
 	// if ml == 1 set id, no payload
@@ -721,7 +791,7 @@ func (p *Peer) FindHandler(r *Request) (HandlerFunc, error) {
 
 func (p *Peer) handleRequests(pc *PeerConn) {
 	for {
-		r, err := p.ReadRequest(pc)
+		r, err := ReadRequest(pc)
 		if err != nil {
 			pc.Conn.Close()
 		}
@@ -731,7 +801,7 @@ func (p *Peer) handleRequests(pc *PeerConn) {
 		if err != nil {
 			pc.Conn.Close()
 		}
-		h.ServePWP(pc.Conn, r)
+		go h.ServePWP(pc.Conn, r)
 	}
 }
 

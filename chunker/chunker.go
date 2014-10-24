@@ -9,9 +9,13 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"strconv"
+	"sync"
 )
 
 type Chunker struct {
+	sync.RWMutex
+
 	Done           chan *os.File
 	hasher         hash.Hash
 	bitfield       *bitset.Bitset
@@ -44,7 +48,6 @@ func NewChunker(hashList []string, chunkSize int, fileSize int, out io.Writer) (
 		return nil, err
 	}
 	c.file = file
-	c.hasher = sha1.New()
 	c.chunksDone = 0
 	c.chunksTotal = len(hashList)
 	c.chunks = make([]*Chunk, len(hashList))
@@ -129,6 +132,9 @@ func (c *Chunker) GetFile() *os.File {
 func (c *Chunker) findChunk(hash string) (*Chunk, int, error) {
 	for i, chunk := range c.chunks {
 		if chunk.hash == hash {
+			if c.bitfield.IsSet(i) {
+				return nil, 0, errors.New("already applied " + strconv.Itoa(i))
+			}
 			return chunk, i, nil
 		}
 	}
@@ -142,11 +148,12 @@ func (c *Chunker) Apply(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	c.hasher.Reset()
-	c.hasher.Write(b)
-	sum := string(c.hasher.Sum(nil))
+	hasher := sha1.New()
+	hasher.Write(b)
+	sum := string(hasher.Sum(nil))
 
-	// XXX I think there is a race here
+	c.Lock()
+	defer c.Unlock()
 	chunk, piece, err := c.findChunk(sum)
 	if err != nil {
 		fmt.Println(err)
@@ -165,7 +172,6 @@ func (c *Chunker) Apply(b []byte) (int, error) {
 	c.bytes_left -= n
 
 	c.chunksDone += 1
-	// XXX: I think there is a race between here and above
 	if c.nextWritePiece == piece {
 		_, err := c.out.Write(b)
 		if err != nil {
