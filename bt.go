@@ -2,7 +2,7 @@ package bt
 
 import (
 	"bytes"
-	"code.google.com/p/bencode-go"
+	"github.com/jackpal/bencode-go"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
